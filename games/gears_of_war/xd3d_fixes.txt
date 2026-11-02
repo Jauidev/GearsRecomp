@@ -1,0 +1,17 @@
+# What tools/find_d3d.py did not find or got wrong in Gears of War (XDK 2.0.3529), checked by hand
+# against GTA IV's (2.0.6274). tools/slot.py passes it on every port; it wins over the search.
+#   <name> <address>          a D3D function
+#   <name> -                  none in this game (its hook is left out)
+#   DeviceOffset(<n>) <m>     a device field: GTA IV keeps it at n, this game at m
+#   DeviceOffset(<n>) -       none in this game: the code that uses it is left out
+
+CreatePixelShader 82222710  # GTA 829D1758: the same allocation and copy, header 0x00100007 (CreateVertexShader is 82222AC8)
+GuestFree 82612898  # XMemFree: CreatePixelShader frees with it (flags 0x24800000), as GTA's with 8218C018
+BindVertexShader 82234D70  # IDirect3DVertexShader9::Bind (shader, flags, declaration, strides, pixel shader): reads the declaration's +0x1C and the shader's +896 vfetch table, marks +872 bit 0x40; UE3 (825A4810) binds each shader once, then draws with the declaration at 0 (82591AF0 stores 0 at 11536)
+GpuWaitCheck 8222F460  # one turn of D3D's GPU waits (state on the caller's stack: device, reason, last read pointer, last progress tick, start tick, start timebase); calls GpuHangHandler after 5000 ticks without progress; called by the ring-space (82221A68), 82220BF0, 82221210 and 8223B058 wait loops
+BeginIndexedVertices 8222D4F8  # (primitive, base vertex, vertices, indices, index format, stride, &indices, &vertices on the stack +84): two 82220EB0 allocations, VGT_INDX_OFFSET = base vertex, stores both at +13080/+13084 like BeginVertices; UE3 calls it twice (8254F298, 8254F378)
+
+DeviceOffset(11812) 11536  # the vertex declaration: GTA SetVertexDeclaration stw 11812(r3) + 1<<51 on +16, 8222F650 stw 11536 + the same; 829DAD70 lwz 11812 = 822346A8 lwz 11536
+DeviceOffset(16544) 20000  # the submitted frame: GpuHangHandler lwz 16544 = lwz 20000; device init puts +16544 (+20000) in VdGlobalDevice slot 24
+DeviceOffset(16552) -  # the completed frame: GTA's flip interrupt (829D4C48) counts it, Gears' Swap writes the flip register itself and keeps no such counter
+DeviceOffset(10920) -  # shader GPR allocation: only XD3D_SetShaderGprAllocation writes it, inlined in Gears
