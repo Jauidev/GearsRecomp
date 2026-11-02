@@ -12,6 +12,8 @@ disco a un APK.
 
 - Arranca y se juega a **30 fps** (el límite del propio juego) en un POCO X6 Pro (Mali-G615).
 - ~95 % del tiempo de CPU es código nativo; lo emulado es el procesador de comandos de la GPU y el audio XMA.
+- Controles táctiles y mandos físicos por Bluetooth o USB (Xbox, PlayStation y la mayoría de mandos
+  Android), a la vez.
 - Probado solo unos minutos de campaña y solo en una GPU Mali.
 
 ## Instalar en Android

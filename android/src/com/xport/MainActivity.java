@@ -106,6 +106,10 @@ public class MainActivity extends Activity {
     // connected.
     private TouchControls controls;
     private int touchMode = 1;
+    // Pad 0 is the touch controls and the physical pad together (sendPad): buttons ORed, the
+    // larger trigger, and for each stick the one pushed further.
+    private final GamepadInput gamepad = new GamepadInput();
+    private int touchButtons, touchLeftTrigger, touchRightTrigger, touchLX, touchLY, touchRX, touchRY;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -140,6 +144,9 @@ public class MainActivity extends Activity {
 
             @Override
             public void onInputDeviceRemoved(int deviceId) {
+                // Whatever the pad held when it went away is released.
+                gamepad.reset();
+                sendPad();
                 gamepadsChanged();
             }
 
@@ -547,8 +554,37 @@ public class MainActivity extends Activity {
         }
     }
 
+    // The touch controls' state merged with the physical pad's, as pad 0 of the game.
+    private void sendPad() {
+        if (!started) {
+            return;
+        }
+        int lx = touchLX, ly = touchLY, rx = touchRX, ry = touchRY;
+        if ((long) gamepad.lx * gamepad.lx + (long) gamepad.ly * gamepad.ly > (long) lx * lx + (long) ly * ly) {
+            lx = gamepad.lx;
+            ly = gamepad.ly;
+        }
+        if ((long) gamepad.rx * gamepad.rx + (long) gamepad.ry * gamepad.ry > (long) rx * rx + (long) ry * ry) {
+            rx = gamepad.rx;
+            ry = gamepad.ry;
+        }
+        nativeSetPad(touchButtons | gamepad.buttons, Math.max(touchLeftTrigger, gamepad.leftTrigger),
+                Math.max(touchRightTrigger, gamepad.rightTrigger), lx, ly, rx, ry);
+    }
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        // In the game, the pad's buttons are the game's pad (a held button's repeats change nothing).
+        if (launcherView == null && started && GamepadInput.fromPad(event.getSource())) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() > 0) {
+                if (gamepad.isPadKey(event.getKeyCode())) {
+                    return true;
+                }
+            } else if (gamepad.onKey(event)) {
+                sendPad();
+                return true;
+            }
+        }
         if (launcherView != null) {
             int key = launcherKey(event.getKeyCode());
             if (key != 0) {
@@ -562,9 +598,14 @@ public class MainActivity extends Activity {
         return super.dispatchKeyEvent(event);
     }
 
-    // The pad's hat (and left stick) move the launcher's focus like the d-pad keys.
+    // In the game, the pad's sticks, triggers and hat are the game's pad. In the launcher, its hat
+    // (and left stick) move the focus like the d-pad keys.
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
+        if (launcherView == null && started && gamepad.onMotion(event)) {
+            sendPad();
+            return true;
+        }
         if (launcherView == null || (event.getSource() & InputDevice.SOURCE_JOYSTICK) == 0
                 || event.getActionMasked() != MotionEvent.ACTION_MOVE) {
             return super.onGenericMotionEvent(event);
@@ -729,7 +770,14 @@ public class MainActivity extends Activity {
                 @Override
                 public void onPad(int buttons, int leftTrigger, int rightTrigger, int lx, int ly,
                         int rx, int ry) {
-                    nativeSetPad(buttons, leftTrigger, rightTrigger, lx, ly, rx, ry);
+                    touchButtons = buttons;
+                    touchLeftTrigger = leftTrigger;
+                    touchRightTrigger = rightTrigger;
+                    touchLX = lx;
+                    touchLY = ly;
+                    touchRX = rx;
+                    touchRY = ry;
+                    sendPad();
                 }
             });
             root.addView(controls);
