@@ -95,10 +95,11 @@ public class MainActivity extends Activity {
     private int counterTick;
     private String counterSystem = "";
     // XPORT_SURFACE_FPS=N in the options: the frame rate the game's surface declares to
-    // SurfaceFlinger (Android 11+). 120 (the default since 2026-10-27): a 30 fps frame is 4
-    // refreshes of 8.3 ms, so one that comes late shows 41.7 ms instead of the 50 ms of a 60 Hz
-    // panel and the micro stutter is half as large. 60 saves some display power. Not 30: a 30 Hz
-    // panel would show a 25 fps game in uneven 33/66 ms steps. 0 declares nothing.
+    // SurfaceFlinger (Android 11+). 60, the default since 2026-11-04: at 120 (2026-10-27 to then)
+    // a late 30 fps frame showed 41.7 ms instead of 50 ms, but SurfaceFlinger and the composer
+    // worked at 120 Hz for a 30 fps game (~60% of a core, POCO X6 Pro, 2026-11-04). 120 brings that
+    // back. Not 30: a 30 Hz panel would show a 25 fps game in uneven 33/66 ms steps. 0 declares
+    // nothing.
     private float surfaceFps;
     // The game runs (nativeStart called): focus changes are passed on from then.
     private boolean started;
@@ -704,7 +705,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        surfaceFps = optionFloat(options, "XPORT_SURFACE_FPS", 120);
+        surfaceFps = optionFloat(options, "XPORT_SURFACE_FPS", 60);
         // The screen's landscape size, known before the surface exists: the native renderer sizes
         // the game's device surfaces from it at boot (rexglue_glue/xd3d/d3d_hooks.cpp).
         android.graphics.Point screen = new android.graphics.Point();
@@ -766,6 +767,9 @@ public class MainActivity extends Activity {
             controls.setAlpha(Math.max(0.1f, Math.min(1, optionFloat(options, "XPORT_TOUCH_ALPHA", 1))));
             controls.setScale(Math.max(0.5f, Math.min(1.5f, optionFloat(options, "XPORT_TOUCH_SCALE", 1))));
             controls.setHaptics(optionFloat(options, "XPORT_TOUCH_HAPTIC", 1) != 0);
+            // Stick moves redraw the pad at most every 33 ms (the game's 30 fps);
+            // XPORT_TOUCH_REDRAW_MS=N changes it (0 = on every move, as before 2026-11-04).
+            controls.setStickRedrawLimit(Math.round(optionFloat(options, "XPORT_TOUCH_REDRAW_MS", 33)));
             controls.setListener(new TouchControls.Listener() {
                 @Override
                 public void onPad(int buttons, int leftTrigger, int rightTrigger, int lx, int ly,

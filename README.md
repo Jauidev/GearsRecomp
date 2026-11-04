@@ -11,6 +11,8 @@ disco a un APK.
 ## Estado
 
 - Arranca y se juega a **30 fps** (el límite del propio juego) en un POCO X6 Pro (Mali-G615).
+- Desde la 1.1.0 usa un ~17 % menos de CPU que la 1.0.1 y traduce en segundo plano los shaders que faltan
+  en la caché, en vez de parar el juego para hacerlo.
 - ~95 % del tiempo de CPU es código nativo; lo emulado es el procesador de comandos de la GPU y el audio XMA.
 - Controles táctiles y mandos físicos por Bluetooth o USB (Xbox, PlayStation y la mayoría de mandos
   Android), a la vez.

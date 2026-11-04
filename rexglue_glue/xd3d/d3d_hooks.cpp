@@ -799,9 +799,66 @@ bool RememberNativeShaderObject(uint32_t shader, const NativeShaderObjectKey& ke
   return true;
 }
 
+#if XPORT_TITLE_ID == 0x4D5307D5
+// Shaders translated in the background (shader_translator.h, AsyncRuntimeShaders; from the Gears of
+// War 3 port): their registration waits here, and SubmitReadyShaderRegistrations (each
+// SetPixelShader, SetVertexShader and Swap) sends it once the translation is done. Until then the
+// renderer skips their draws (active-shader-texture-metadata), as it skips draws whose pipeline is
+// compiling.
+struct DeferredShaderRegistration {
+  ShaderStage stage;
+  uint64_t hash;
+};
+std::mutex g_deferred_shader_mutex;
+std::unordered_map<uint32_t, DeferredShaderRegistration> g_deferred_shaders;
+std::atomic<uint64_t> g_deferred_shader_serial{0};
+
+void DeferShaderRegistration(uint32_t shader, ShaderStage stage, uint64_t hash) {
+  std::lock_guard lock(g_deferred_shader_mutex);
+  g_deferred_shaders[shader] = {stage, hash};
+}
+
+void ForgetDeferredShaderRegistration(uint32_t shader) {
+  std::lock_guard lock(g_deferred_shader_mutex);
+  g_deferred_shaders.erase(shader);
+}
+
+void SubmitReadyShaderRegistrations() {
+  const uint64_t serial = rex::graphics::xnative::RuntimeShaderSerial();
+  if (serial == g_deferred_shader_serial.load(std::memory_order_relaxed)) {
+    return;
+  }
+  std::vector<RegisterShaderCommand> ready;
+  {
+    std::lock_guard lock(g_deferred_shader_mutex);
+    g_deferred_shader_serial.store(serial, std::memory_order_relaxed);
+    for (auto it = g_deferred_shaders.begin(); it != g_deferred_shaders.end();) {
+      if (rex::graphics::xnative::RuntimeShaderPending(it->second.hash)) {
+        ++it;
+        continue;
+      }
+      // Translated, or failed: then the registration misses the cache as it did when the hook
+      // translated it.
+      RegisterShaderCommand command;
+      command.shader = it->first;
+      command.stage = it->second.stage;
+      command.hash = it->second.hash;
+      ready.push_back(command);
+      it = g_deferred_shaders.erase(it);
+    }
+  }
+  for (const RegisterShaderCommand& command : ready) {
+    SubmitNativeCommand(command);
+  }
+}
+#endif
+
 void ForgetNativeShaderObject(uint32_t shader) {
   std::lock_guard lock(g_native_shader_objects_mutex);
   g_native_shader_objects.erase(shader);
+#if XPORT_TITLE_ID == 0x4D5307D5
+  ForgetDeferredShaderRegistration(shader);
+#endif
 }
 
 #ifdef XD3D_BindVertexShader
@@ -867,8 +924,21 @@ void RegisterNativeShaderObject(uint8_t* base, uint32_t shader, uint32_t microco
     return;
   }
   const uint64_t canonical = rex::graphics::xnative::CanonicalShaderHash(hash);
-  rex::graphics::xnative::PrepareRuntimeShader(canonical, container.data(), container.size(),
-                                               stage == ShaderStage::kPixel);
+#if XPORT_TITLE_ID == 0x4D5307D5
+  if (rex::graphics::xnative::AsyncRuntimeShaders()) {
+    if (rex::graphics::xnative::QueueRuntimeShader(canonical, container.data(),
+                                                   uint32_t(container.size()),
+                                                   stage == ShaderStage::kPixel)) {
+      DeferShaderRegistration(shader, stage, canonical);
+      return;
+    }
+    ForgetDeferredShaderRegistration(shader);
+  } else
+#endif
+  {
+    rex::graphics::xnative::PrepareRuntimeShader(canonical, container.data(), container.size(),
+                                                 stage == ShaderStage::kPixel);
+  }
   RegisterShaderCommand command;
   command.shader = shader;
   command.stage = stage;
@@ -913,11 +983,23 @@ void RegisterNativeShader(PPCContext& ctx, uint8_t* base, GuestFunction implemen
   }
   // A shader the SPIR-V cache lacks is translated now, while the container is whole, so the
   // renderer has it by the time the registration below reaches it.
+  [[maybe_unused]] bool deferred = false;
   if (hash && native_mode) {
-    rex::graphics::xnative::PrepareRuntimeShader(
-        rex::graphics::xnative::CanonicalShaderHash(hash),
-        static_cast<const uint8_t*>(GuestPointer(base, shader_container)), total_size,
-        stage == ShaderStage::kPixel);
+#if XPORT_TITLE_ID == 0x4D5307D5
+    // Gears of War: queued (a copy of the container), registered once translated.
+    if (rex::graphics::xnative::AsyncRuntimeShaders()) {
+      deferred = rex::graphics::xnative::QueueRuntimeShader(
+          rex::graphics::xnative::CanonicalShaderHash(hash),
+          static_cast<const uint8_t*>(GuestPointer(base, shader_container)), total_size,
+          stage == ShaderStage::kPixel);
+    } else
+#endif
+    {
+      rex::graphics::xnative::PrepareRuntimeShader(
+          rex::graphics::xnative::CanonicalShaderHash(hash),
+          static_cast<const uint8_t*>(GuestPointer(base, shader_container)), total_size,
+          stage == ShaderStage::kPixel);
+    }
   }
 
   g_creating_vertex_shader = stage == ShaderStage::kVertex;
@@ -929,7 +1011,16 @@ void RegisterNativeShader(PPCContext& ctx, uint8_t* base, GuestFunction implemen
     command.shader = ctx.r3.u32;
     command.stage = stage;
     command.hash = rex::graphics::xnative::CanonicalShaderHash(hash);
+#if XPORT_TITLE_ID == 0x4D5307D5
+    if (deferred) {
+      DeferShaderRegistration(command.shader, stage, command.hash);
+    } else {
+      ForgetDeferredShaderRegistration(command.shader);
+      SubmitNativeCommand(command);
+    }
+#else
     SubmitNativeCommand(command);
+#endif
     // Known now: setting it registers it no second time.
     if (stage == ShaderStage::kPixel) {
       const uint32_t shader = ctx.r3.u32;
@@ -2072,6 +2163,9 @@ PPC_FUNC(XD3D_SetPixelShader) {
 
   const uint32_t device = ctx.r3.u32;
   const uint32_t shader = ctx.r4.u32;
+#if XPORT_TITLE_ID == 0x4D5307D5
+  SubmitReadyShaderRegistrations();
+#endif
   RegisterNativePixelShaderOnSet(base, shader);
   if (kObserve) {
     XD3D_IMP(SetPixelShader)(ctx, base);
@@ -2113,6 +2207,9 @@ PPC_FUNC(XD3D_SetVertexShader) {
 
   const uint32_t device = ctx.r3.u32;
   const uint32_t shader = ctx.r4.u32;
+#if XPORT_TITLE_ID == 0x4D5307D5
+  SubmitReadyShaderRegistrations();
+#endif
   if (kObserve) {
     XD3D_IMP(SetVertexShader)(ctx, base);
   } else {
@@ -2975,6 +3072,9 @@ PPC_FUNC(XD3D_Swap) {
   }
 
   const uint32_t device = ctx.r3.u32;
+#if XPORT_TITLE_ID == 0x4D5307D5
+  SubmitReadyShaderRegistrations();
+#endif
   const uint32_t submitted_frame = LoadU32(base, device + kSubmittedFrameOffset) + 1;
   if (!kObserve) {
     StoreU32(base, device + kSubmittedFrameOffset, submitted_frame);

@@ -35,12 +35,23 @@ rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/lib/arm64-v8a"
 # The manifest with the game's name (the package is renamed at link time).
 sed "s|android:label=\"[^\"]*\"|android:label=\"$LABEL\"|" "$MANIFEST" > "$OUT/AndroidManifest.xml"
+# Not debuggable, so ART compiles the Java instead of interpreting it with CheckJNI, but profileable
+# from the shell so simpleperf still records it. XPORT_DEBUGGABLE=1 (or VALIDATION=1 / GFXR=1, whose
+# layers need it) keeps it debuggable.
+if [ "${XPORT_DEBUGGABLE:-0}" != 1 ] && [ "${VALIDATION:-0}" != 1 ] && [ "${GFXR:-0}" != 1 ]; then
+  sed -i 's|android:debuggable="true"|android:debuggable="false"|; s|^\( *\)<activity$|\1<profileable android:shell="true" />\n\1<activity|' \
+      "$OUT/AndroidManifest.xml"
+  grep -q '<profileable android:shell="true" />' "$OUT/AndroidManifest.xml" || { echo "manifest: profileable not added" >&2; exit 1; }
+fi
 
-"$JDK/bin/javac" -source 8 -target 8 -bootclasspath "$JAR" -nowarn -Xlint:-options \
-    -d "$OUT/classes" $(find "$ROOT/android/src" -name '*.java')
-"$BT/d8.bat" --release --min-api 29 --lib "$JAR" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
-# The app icon (LAUNCHER/res, made by tools/make_icon.py).
-"$BT/aapt2.exe" compile --dir "$ROOT/LAUNCHER/res" -o "$OUT/res.zip"
+# Source and class lists relative to their folder: a project path with spaces would split them.
+(cd "$ROOT/android/src" && "$JDK/bin/javac" -source 8 -target 8 -bootclasspath "$JAR" -nowarn -Xlint:-options \
+    -d "$OUT/classes" $(find . -name '*.java'))
+(cd "$OUT/classes" && "$BT/d8.bat" --release --min-api 29 --lib "$JAR" --output "$OUT/dex" $(find . -name '*.class'))
+# The app icon (made by tools/make_icon.py): the game's own (games/<game>/LAUNCHER/res), else LAUNCHER/res.
+ICON_RES="$ROOT/games/$GAME/LAUNCHER/res"
+[ -d "$ICON_RES" ] || ICON_RES="$ROOT/LAUNCHER/res"
+"$BT/aapt2.exe" compile --dir "$ICON_RES" -o "$OUT/res.zip"
 "$BT/aapt2.exe" link -o "$OUT/base.apk" --manifest "$OUT/AndroidManifest.xml" -I "$JAR" "$OUT/res.zip" \
     --min-sdk-version 29 --target-sdk-version 34 --rename-manifest-package "com.xport.$GAME"
 

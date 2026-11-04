@@ -29,4 +29,22 @@ void PrepareRuntimeShader(uint64_t hash, const uint8_t* container, uint32_t size
 // The translation of a shader the cache lacks, or nullptr.
 const RuntimeShader* FindRuntimeShader(uint64_t hash);
 
+#if XPORT_TITLE_ID == 0x4D5307D5
+// Gears of War (from the Gears of War 3 port): shaders the cache lacks are translated on a thread of
+// their own (XpShaderXlate) instead of in the D3D hook, where each took 49-93 ms of the game's render
+// thread (phone, 2026-11-04: four at once in the prison cell froze the game ~0.3 s). Their draws are
+// skipped until the translation is done, as draws whose pipeline is still compiling are. On by
+// default on Android; XNATIVE_ASYNC_SHADERS=0/1 overrides.
+bool AsyncRuntimeShaders();
+
+// As PrepareRuntimeShader, but a shader that has to be translated is queued: true while it waits
+// or is being translated (the caller registers it once RuntimeShaderPending says it is done).
+bool QueueRuntimeShader(uint64_t hash, const uint8_t* container, uint32_t size, bool pixel);
+bool RuntimeShaderPending(uint64_t hash);
+
+// How many queued translations have finished (succeeded or failed), to tell cheaply whether any
+// pending one may be done.
+uint64_t RuntimeShaderSerial();
+#endif
+
 }  // namespace rex::graphics::xnative

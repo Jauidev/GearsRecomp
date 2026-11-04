@@ -79,6 +79,21 @@ public class TouchControls extends View {
     private boolean haptics = true;
     private Listener listener;
     private int lastButtons = -1, lastLX, lastLY, lastRX, lastRY;
+    // setStickRedrawLimit: stick moves redraw at most every this many ms (0 = on every move).
+    // Following the finger at the panel's rate redrew the whole overlay, labels included, several
+    // times per 30 fps game frame (Java + hwui ~10% of a core, POCO X6 Pro, 2026-11-04). Presses,
+    // releases and the pad state sent to the game are not delayed.
+    private long stickRedrawMs;
+    private long lastRedraw;
+    private boolean redrawPosted;
+    private final Runnable delayedRedraw = new Runnable() {
+        @Override
+        public void run() {
+            redrawPosted = false;
+            lastRedraw = android.os.SystemClock.uptimeMillis();
+            invalidate();
+        }
+    };
 
     public TouchControls(Context context) {
         super(context);
@@ -233,11 +248,32 @@ public class TouchControls extends View {
             default:
                 return true;
         }
-        sendState();
+        sendState(action != MotionEvent.ACTION_MOVE);
         return true;
     }
 
-    private void sendState() {
+    void setStickRedrawLimit(long milliseconds) {
+        stickRedrawMs = Math.max(0, milliseconds);
+    }
+
+    // At once for presses and releases; stick moves are spaced stickRedrawMs apart, the last one
+    // always drawn.
+    private void redraw(boolean now) {
+        long time = android.os.SystemClock.uptimeMillis();
+        if (now || stickRedrawMs == 0 || time - lastRedraw >= stickRedrawMs) {
+            if (redrawPosted) {
+                removeCallbacks(delayedRedraw);
+                redrawPosted = false;
+            }
+            lastRedraw = time;
+            invalidate();
+        } else if (!redrawPosted) {
+            redrawPosted = true;
+            postDelayed(delayedRedraw, stickRedrawMs - (time - lastRedraw));
+        }
+    }
+
+    private void sendState(boolean pressOrRelease) {
         int bits = 0;
         for (Button button : buttons) {
             if (button.pointer >= 0) {
@@ -251,6 +287,7 @@ public class TouchControls extends View {
         if (!changed) {
             return;
         }
+        boolean buttonsChanged = bits != lastButtons;
         lastButtons = bits;
         lastLX = lx;
         lastLY = ly;
@@ -260,7 +297,7 @@ public class TouchControls extends View {
             listener.onPad(bits & 0xFFFF, (bits & LEFT_TRIGGER) != 0 ? 255 : 0,
                     (bits & RIGHT_TRIGGER) != 0 ? 255 : 0, lx, ly, rx, ry);
         }
-        invalidate();
+        redraw(pressOrRelease || buttonsChanged);
     }
 
     private void drawStick(Canvas canvas, Stick stick) {

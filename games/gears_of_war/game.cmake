@@ -4,7 +4,7 @@ set(XPORT_TITLE_ID 0x4D5307D5)
 set(XPORT_XEX_MEDIA 0x76E9DF5B)
 set(XPORT_XEX_VERSION 0x00000001)
 # The app's name on the phone (tools/build-apk.sh).
-set(XPORT_APP_LABEL "Gears of War")
+set(XPORT_APP_LABEL "GearsRecomp")
 # The launcher's colours (0xRRGGBB) to go with its own background, LAUNCHER/FONDO.png: the accent
 # (selection, buttons) is the crimson of the logo, the glass tint a warm charcoal. Without them the
 # launcher uses the GPU's (Mali blue, Adreno red).

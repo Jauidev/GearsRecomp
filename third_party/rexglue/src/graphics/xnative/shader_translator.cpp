@@ -29,6 +29,17 @@
 
 #include "xenos_recomp_bridge.h"
 
+#if XPORT_TITLE_ID == 0x4D5307D5
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#if !REX_PLATFORM_WINDOWS
+#include <pthread.h>
+#include <sys/resource.h>
+#endif
+#endif
+
 namespace rex::graphics::xnative {
 namespace {
 
@@ -338,5 +349,178 @@ const RuntimeShader* FindRuntimeShader(uint64_t hash) {
   const auto found = g_shaders.find(hash);
   return found != g_shaders.end() ? found->second.get() : nullptr;
 }
+
+#if XPORT_TITLE_ID == 0x4D5307D5
+namespace {
+
+struct ShaderJob {
+  uint64_t hash;
+  bool pixel;
+  std::vector<uint8_t> container;
+};
+
+// The queue of the translation thread. Never destroyed: the thread may still be translating while
+// the process exits.
+struct AsyncShaderState {
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::deque<ShaderJob> jobs;
+  // queued or being translated; a hash leaves it after its result is in g_shaders or g_failed.
+  std::unordered_set<uint64_t> pending;
+  std::atomic<uint64_t> finished{0};
+  bool started = false;
+};
+
+AsyncShaderState& AsyncShaders() {
+  static AsyncShaderState* const state = new AsyncShaderState;
+  return *state;
+}
+
+// PrepareRuntimeShader's translation, without its lock (only the translation thread runs this one,
+// and PrepareRuntimeShader is not called while asynchronous translation is on).
+std::unique_ptr<RuntimeShader> TranslateQueuedShader(const ShaderJob& job) {
+  IDxcCompiler3* compiler = Compiler();
+  if (!compiler) {
+    return nullptr;
+  }
+  const bool pixel = job.pixel;
+  const std::string* patch = ShaderPatch(job.hash);
+  const auto start = std::chrono::steady_clock::now();
+  XenosRecompOutput output;
+  std::vector<uint8_t> smolv;
+  if (!RecompileXenosShader(job.container.data(), kShaderCommon, output)) {
+    REXLOG_ERROR("xnative: runtime shader translation failed for {} shader {:016X}: {}",
+                 pixel ? "pixel" : "vertex", job.hash, output.error);
+    return nullptr;
+  }
+  if (output.pixel != pixel) {
+    REXLOG_ERROR("xnative: runtime shader {:016X} is a {} shader registered as {}", job.hash,
+                 output.pixel ? "pixel" : "vertex", pixel ? "pixel" : "vertex");
+    return nullptr;
+  }
+  if (patch) {
+    const size_t end = output.hlsl.rfind(pixel ? "BRANCH if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)"
+                                               : "if (g_ClipPlaneEnabled)");
+    if (end != std::string::npos) {
+      output.hlsl.insert(end, *patch);
+    }
+  }
+  if (!CompileSpirv(compiler, output.hlsl, pixel, smolv, output.error)) {
+    REXLOG_ERROR("xnative: DXC rejected runtime {} shader {:016X}: {}", pixel ? "pixel" : "vertex",
+                 job.hash, output.error.substr(0, 400));
+    return nullptr;
+  }
+  auto shader = MakeShader(job.hash, pixel, output.spec_constants_mask, output.used_texture_mask,
+                           std::move(smolv));
+  if (!patch) {
+    SaveToDisk(*shader, pixel);
+  }
+  const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+  REXLOG_INFO("xnative: translated {} shader {:016X} in {} ms ({} SMOL-V bytes, in the background)",
+              pixel ? "pixel" : "vertex", job.hash, milliseconds, shader->smolv.size());
+  return shader;
+}
+
+void TranslationThread() {
+#if defined(__ANDROID__) || defined(__linux__)
+  pthread_setname_np(pthread_self(), "XpShaderXlate");
+#endif
+#ifdef __ANDROID__
+  // As the runtime's other background threads (XpTexCache, XpRetirer: nice 4): a translation never
+  // preempts the game's threads, it only fills idle time.
+  setpriority(PRIO_PROCESS, 0, 4);
+#endif
+  AsyncShaderState& state = AsyncShaders();
+  std::unique_lock lock(state.mutex);
+  while (true) {
+    state.wake.wait(lock, [&state] { return !state.jobs.empty(); });
+    ShaderJob job = std::move(state.jobs.front());
+    state.jobs.pop_front();
+    lock.unlock();
+    std::unique_ptr<RuntimeShader> shader = TranslateQueuedShader(job);
+    {
+      std::lock_guard shaders_lock(g_mutex);
+      if (shader) {
+        g_shaders.emplace(job.hash, std::move(shader));
+      } else {
+        g_failed.insert(job.hash);
+      }
+    }
+    lock.lock();
+    state.pending.erase(job.hash);
+    state.finished.fetch_add(1, std::memory_order_release);
+  }
+}
+
+}  // namespace
+
+bool AsyncRuntimeShaders() {
+  static const bool enabled = [] {
+    if (const char* value = std::getenv("XNATIVE_ASYNC_SHADERS"); value && *value) {
+      return value[0] == '1';
+    }
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+bool QueueRuntimeShader(uint64_t hash, const uint8_t* container, uint32_t size, bool pixel) {
+  const std::string* patch = ShaderPatch(hash);
+  if (!Enabled() || !container || !size || (!patch && InStockCache(hash))) {
+    return false;
+  }
+  AsyncShaderState& state = AsyncShaders();
+  {
+    std::lock_guard lock(state.mutex);
+    if (state.pending.count(hash)) {
+      return true;
+    }
+  }
+  // Not pending: either never queued, or its result is already in g_shaders/g_failed (the thread
+  // stores it before it leaves pending).
+  {
+    std::lock_guard lock(g_mutex);
+    if (g_shaders.count(hash) || g_failed.count(hash)) {
+      return false;
+    }
+  }
+  // A translation kept on disk is a small file: read here, as PrepareRuntimeShader does.
+  if (!patch) {
+    if (auto shader = LoadFromDisk(hash, pixel)) {
+      std::lock_guard lock(g_mutex);
+      g_shaders.emplace(hash, std::move(shader));
+      return false;
+    }
+  }
+  std::lock_guard lock(state.mutex);
+  if (!state.pending.insert(hash).second) {
+    return true;
+  }
+  // A copy, so the title cannot change the container under the recompiler.
+  state.jobs.push_back({hash, pixel, std::vector<uint8_t>(container, container + size)});
+  if (!state.started) {
+    state.started = true;
+    std::thread(TranslationThread).detach();
+  }
+  state.wake.notify_one();
+  return true;
+}
+
+bool RuntimeShaderPending(uint64_t hash) {
+  AsyncShaderState& state = AsyncShaders();
+  std::lock_guard lock(state.mutex);
+  return state.pending.count(hash) != 0;
+}
+
+uint64_t RuntimeShaderSerial() {
+  return AsyncShaders().finished.load(std::memory_order_acquire);
+}
+#endif
 
 }  // namespace rex::graphics::xnative

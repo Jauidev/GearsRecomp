@@ -400,6 +400,55 @@ namespace
             }
         }
 
+        // count consecutive registers from base, written in bulk: per dword, WriteRegister costs a
+        // call, a chain of compares and the ring's modulo (xport-gpu ~9% of a core on the POCO X6 Pro,
+        // 2026-11-04). Leaves the same state as WriteRegister per dword: registers below 0x4000 hold
+        // the ring's big-endian bytes in MMIO memory, constants (0x4000-0x5FFF) are stored host-endian,
+        // 0x6000-0x7FFF are dropped. Returns false, having read nothing, for runs that need
+        // WriteRegister: the registers it treats specially, a run across 0x4000 or one that wraps
+        // through index & 0x7FFF. XPORT_PM4_BULK=0 turns it off.
+        bool WriteRegisterRun(PacketReader& reader, uint32_t base, uint32_t count)
+        {
+            static const bool enabled = []
+            {
+                const char* value = getenv("XPORT_PM4_BULK");
+                return !(value && *value == '0');
+            }();
+            const uint32_t last = base + count;  // exclusive
+            if (!enabled || last > 0x8000 || (base < 0x4000 && last > 0x4000))
+                return false;
+            if (base < 0x4000)
+            {
+                const auto inside = [&](uint32_t index) { return index - base < count; };
+                if (inside(REG_DC_LUT_RW_INDEX) || inside(REG_DC_LUT_30_COLOR) || inside(REG_COHER_STATUS_HOST) ||
+                    (base < REG_SCRATCH_REG0 + 8 && last > REG_SCRATCH_REG0))
+                    return false;
+            }
+            uint32_t index = base;
+            uint32_t remaining = count;
+            while (remaining != 0)
+            {
+                // Contiguous dwords up to the end of the ring (a linear buffer has no end here).
+                const uint32_t run = reader.size ? std::min(remaining, reader.size - reader.index) : remaining;
+                const auto* source = reinterpret_cast<const uint32_t*>(Physical(reader.base + reader.index * 4));
+                if (index < 0x4000)
+                {
+                    std::memcpy(g_memory.base + MMIO_BASE + index * 4, source, size_t(run) * 4);
+                }
+                else if (index - 0x4000 < std::size(m_constants))
+                {
+                    const uint32_t first = index - 0x4000;
+                    const uint32_t stored = std::min<uint32_t>(run, uint32_t(std::size(m_constants)) - first);
+                    for (uint32_t i = 0; i < stored; i++)
+                        m_constants[first + i] = ByteSwap(source[i]);
+                }
+                reader.Skip(run);
+                index += run;
+                remaining -= run;
+            }
+            return true;
+        }
+
         // Runs the guest interrupt callback on the calling thread, as Xenia's EmulateCPInterruptDPC does.
         void DispatchInterrupt(uint32_t source, uint32_t cpu)
         {
@@ -475,6 +524,8 @@ namespace
                 const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
                 const uint32_t base = packet & 0x7FFF;
                 const bool oneRegister = (packet >> 15) & 1;
+                if (!oneRegister && WriteRegisterRun(reader, base, count))
+                    break;
                 for (uint32_t i = 0; i < count; i++)
                     WriteRegister(oneRegister ? base : base + i, reader.Read());
                 break;
@@ -660,6 +711,8 @@ namespace
                 if (type >= std::size(s_bases))
                     break;
                 index += s_bases[type];
+                if (WriteRegisterRun(reader, index, count - consumed))
+                    break;  // the reader is put back at the packet's end below
                 while (consumed < count)
                     WriteRegister(index++, read());
                 break;

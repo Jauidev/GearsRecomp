@@ -21,7 +21,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <algorithm>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -65,18 +67,64 @@ void PcWindowThread(std::function<rex::ui::Presenter*()> presenter);
 
 namespace {
 
+// A paint the presenter asks for later (its frame pacer's next slot,
+// Window::RequestPaintAfterNanoseconds) waits until then. Without it SurfaceWindow fell back to an
+// immediate paint, so the UI thread retried in a busy loop until the slot: on the POCO X6 Pro
+// (2026-11-04, prison cell) ~20% of a big core in PaintFromUIThreadImpl, clock_gettime and the
+// presenter's mutex. On by default on Android; XPORT_TIMED_REPAINT=0/1 overrides.
+bool TimedRepaint() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("XPORT_TIMED_REPAINT");
+    if (value && *value) return *value == '1';
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
 class UiContext final : public rex::ui::WindowedAppContext {
  public:
   // Runs the UI loop on the thread that created the context.
   void Run() {
     while (true) {
+      std::function<void()> timed;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        condition_.wait(lock, [this] { return pending_; });
+        while (!pending_) {
+          if (!timed_due_) {
+            condition_.wait(lock);
+          } else if (std::chrono::steady_clock::now() >= *timed_due_) {
+            timed = std::move(timed_function_);
+            timed_function_ = nullptr;
+            timed_due_.reset();
+            break;
+          } else {
+            condition_.wait_until(lock, *timed_due_);
+          }
+        }
         pending_ = false;
+      }
+      if (timed) {
+        timed();
       }
       ExecutePendingFunctionsFromUIThread();
     }
+  }
+
+  // Runs function on the UI thread at due (the earliest one if asked again before then). Calls
+  // in the meantime still run at once.
+  void CallInUIThreadAt(std::chrono::steady_clock::time_point due, std::function<void()> function) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!timed_due_ || due < *timed_due_) {
+        timed_due_ = due;
+      }
+      timed_function_ = std::move(function);
+    }
+    condition_.notify_one();
   }
 
  protected:
@@ -93,14 +141,16 @@ class UiContext final : public rex::ui::WindowedAppContext {
   std::mutex mutex_;
   std::condition_variable condition_;
   bool pending_ = false;
+  std::optional<std::chrono::steady_clock::time_point> timed_due_;
+  std::function<void()> timed_function_;
 };
 
 // A Window over the activity's SurfaceView: fullscreen, no menus, no input (input reaches the
 // game through the runtime).
 class SurfaceWindow final : public rex::ui::Window {
  public:
-  explicit SurfaceWindow(rex::ui::WindowedAppContext& app_context)
-      : Window(app_context, game::Title(), 1280, 720) {}
+  explicit SurfaceWindow(UiContext& ui_context)
+      : Window(ui_context, game::Title(), 1280, 720), ui_context_(ui_context) {}
   ~SurfaceWindow() override { EnterDestructor(); }
 
   // UI thread.
@@ -140,8 +190,18 @@ class SurfaceWindow final : public rex::ui::Window {
   void RequestPaintImpl() override {
     app_context().CallInUIThreadDeferred([this]() { OnPaint(); });
   }
+  void RequestPaintAfterNanosecondsImpl(uint64_t delay_ns) override {
+    if (!TimedRepaint()) {
+      Window::RequestPaintAfterNanosecondsImpl(delay_ns);
+      return;
+    }
+    // At most 250 ms, as a guard against a bogus delay (the pacer's are below one frame).
+    const auto delay = std::chrono::nanoseconds(std::min<uint64_t>(delay_ns, 250'000'000));
+    ui_context_.CallInUIThreadAt(std::chrono::steady_clock::now() + delay, [this]() { OnPaint(); });
+  }
 
  private:
+  UiContext& ui_context_;
   ANativeWindow* native_window_ = nullptr;
 };
 

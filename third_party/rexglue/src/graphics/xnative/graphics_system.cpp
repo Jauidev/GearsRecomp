@@ -611,6 +611,40 @@ std::atomic<uint64_t> g_draw_state_kept{0};
 // (xnative_store_op_none) attachments opened with STORE_OP_NONE, and scopes ended
 // early because a command was about to write one of them (a wrong prediction).
 std::atomic<uint64_t> g_store_none_attachments{0}, g_store_none_splits{0};
+// Depth/stencil-only draws that joined the open color pass (joins_open_pass).
+std::atomic<uint32_t> g_colorless_joins{0};
+// Gears of War (XNATIVE_FRAGMENT_READ_BARRIERS, Android default; from the Gears of War 3 port): the barrier that makes a
+// resolved or copied image readable waits for the fragment shaders only. Naming the vertex
+// stage there made the Mali finish all queued fragment work before the next pass could start
+// its geometry, ~45 times a frame in Gears 3 (~12 in Gears 1's prison cell, 2026-11-04). A draw whose vertex shader samples textures adds that
+// dependency first (one memory barrier outside the pass, while one is pending). Recorder thread.
+std::atomic<bool> g_vertex_visibility_pending{false};
+std::atomic<uint32_t> g_vertex_visibility_barriers{0}, g_vertex_visibility_splits{0};
+bool FragmentOnlyReadBarriers() {
+#if XPORT_TITLE_ID == 0x4D5307D5
+  static const bool enabled = [] {
+    const char* value = std::getenv("XNATIVE_FRAGMENT_READ_BARRIERS");
+    if (value && *value) return *value == '1';
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+// The destination stages of a barrier that makes a fragment- or transfer-written image
+// readable by later shaders.
+VkPipelineStageFlags ShaderReadStagesAfterWrite() {
+  if (FragmentOnlyReadBarriers()) {
+    g_vertex_visibility_pending.store(true, std::memory_order_relaxed);
+    return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  }
+  return VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+}
 // (XNATIVE_DRAW_TRACE) the trace file while the command being recorded is traced: its draw adds
 // the attachments it really renders to.
 FILE* g_draw_trace_host = nullptr;
@@ -5817,7 +5851,12 @@ void NativeGraphicsSystem::RenderWorkerMain() {
               std::string top;
               for (size_t i = 0; i < reasons.size() && i < 10; ++i)
                 top += fmt::format(" {:03X}={:.0f}", reasons[i].second, reasons[i].first / 120.0);
-              __android_log_print(ANDROID_LOG_WARN, "xnative", "split-reasons/frame:%s", top.c_str());
+              __android_log_print(ANDROID_LOG_WARN, "xnative",
+                                  "split-reasons/frame:%s colorless-joins=%.1f vertex-visibility=%.1f "
+                                  "splits=%.2f",
+                                  top.c_str(), g_colorless_joins.exchange(0) / 120.0,
+                                  g_vertex_visibility_barriers.exchange(0) / 120.0,
+                                  g_vertex_visibility_splits.exchange(0) / 120.0);
             }
             pipeline_report_frames_ = 0;
             pipelined_sync_waits_ = 0;
@@ -20175,7 +20214,7 @@ bool NativeGraphicsSystem::RecordPackedDepthAlias(
   ready.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   ready.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      ShaderReadStagesAfterWrite(),
       0, 0, nullptr, 0, nullptr, 1, &ready); });
   source.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -20461,7 +20500,7 @@ bool NativeGraphicsSystem::RecordResolveConversion(
   }
   profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
       command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+      ShaderReadStagesAfterWrite(), 0, 0, nullptr, 0,
       nullptr, hdr_mirror ? 2 : 1, destination_barriers.data()); });
   source.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -20708,7 +20747,7 @@ void NativeGraphicsSystem::CompleteProducerDepthResolve(
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   vulkan_provider->vulkan_device()->functions().vkCmdPipelineBarrier(
       command_buffer, kNativeDepthStencilResolveStages,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      ShaderReadStagesAfterWrite(),
       0, 0, nullptr, 0, nullptr, uint32_t(barriers.size()), barriers.data());
   producer.source->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   producer.destination->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -20873,7 +20912,7 @@ bool NativeGraphicsSystem::RecordDepthResolveConversion(
       profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
           command_buffer,
           kNativeDepthStencilResolveStages,
-          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+          ShaderReadStagesAfterWrite(), 0, 0,
           nullptr, 0, nullptr, uint32_t(read_barriers.size()), read_barriers.data()); });
       source.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -21022,7 +21061,7 @@ bool NativeGraphicsSystem::RecordDepthResolveConversion(
   profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
       command_buffer,
       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+      ShaderReadStagesAfterWrite(), 0, 0, nullptr, 0,
       nullptr, 1, &destination_barrier); });
   source.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -22245,7 +22284,7 @@ bool NativeGraphicsSystem::RecordResolve(VkCommandBuffer command_buffer,
           ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
       swap_dfn.vkCmdPipelineBarrier(
           command_buffer, synchronization.stages,
-          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+          ShaderReadStagesAfterWrite(), 0, 0,
           nullptr, 0, nullptr, 1, &barrier);
       destination->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       destination->content.CommitResolve(submitted_frame,
@@ -22739,7 +22778,7 @@ bool NativeGraphicsSystem::RecordResolve(VkCommandBuffer command_buffer,
   destination_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] { return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
       command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+      ShaderReadStagesAfterWrite(), 0, 0, nullptr, 0,
       nullptr, 1, &destination_barrier); });
   content_source->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   destination->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -23504,6 +23543,41 @@ bool NativeGraphicsSystem::RecordNativeFrame(
     if (profile_scopes) gpu_labels::EndSceneScope(vulkan_provider->vulkan_device(), command_buffer, *native_gpu_scope_summary_);
     CompleteProducerDepthResolve(command_buffer, producer_depth_resolve);
   };
+#if XPORT_TITLE_ID == 0x4D5307D5
+  // (XNATIVE_FRAGMENT_READ_BARRIERS) draws whose vertex shader samples textures, and the
+  // vertex-stage dependency the fragment-only read barriers leave out. Commands before
+  // vertex_visibility_clear_until were scanned and need none (no such draw before the resolve).
+  const auto vertex_samples_textures = [](const NativeCommand& command) {
+    if (command.type != CommandType::kDrawPrimitive &&
+        command.type != CommandType::kDrawPrimitiveUp &&
+        command.type != CommandType::kDrawIndexedPrimitive) {
+      return false;
+    }
+    const NativeShader* vertex_shader =
+        command.pipeline_state ? command.pipeline_state->vertex_shader_resource : nullptr;
+    return vertex_shader &&
+           (vertex_shader->used_texture_mask | vertex_shader->override_used_texture_mask) != 0;
+  };
+  const auto record_vertex_visibility = [&] {
+    VkMemoryBarrier memory_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memory_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                   VK_ACCESS_TRANSFER_WRITE_BIT;
+    memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    profile::CpuCall(profile::CpuOp::kDriverBarrier, [&] {
+      return (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(
+          command_buffer,
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
+    });
+    g_vertex_visibility_pending.store(false, std::memory_order_relaxed);
+    g_vertex_visibility_barriers.fetch_add(1, std::memory_order_relaxed);
+  };
+  size_t vertex_visibility_clear_until = 0;
+#endif
 
   auto targets_equal = [](const NativeRenderingTarget& left, const NativeRenderingTarget& right) {
     return NativeRenderingAttachmentsEqual(left, right);
@@ -23571,6 +23645,31 @@ bool NativeGraphicsSystem::RecordNativeFrame(
   // recorder's CPU (2026-10-27 profile). Bits outside wanted may be missing from the result.
   size_t prediction_begin = 0, prediction_stop = 0;
   uint32_t prediction_stop_reason = 0, prediction_stop_slots = 0;
+#if XPORT_TITLE_ID == 0x4D5307D5
+  // Gears of War (phone performance; from the Gears of War 3 port): draws that write only depth/stencil (color writes off:
+  // a light's stencil setup, an occlusion box) and sample no texture join the open color pass
+  // when the depth-stencil attachment is the same (ReuseNativeLightingAttachments), instead of
+  // ending it for a pass without color and opening the color pass again right after. In the
+  // Gears 3 plaza that was about 60 of the 105 pass ends per frame (~4 of ~25 in Gears 1), each a store and reload of the tiles
+  // on the Mali. On by default on Android only; XNATIVE_COLORLESS_JOIN=0/1 overrides it.
+  static const bool colorless_join = [] {
+    const char* value = std::getenv("XNATIVE_COLORLESS_JOIN");
+    if (value && *value) return *value == '1';
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+  }();
+  const auto joins_open_pass = [&](const NativeCommand& command) {
+    return colorless_join &&
+           (command.type == CommandType::kDrawPrimitive ||
+            command.type == CommandType::kDrawPrimitiveUp ||
+            command.type == CommandType::kDrawIndexedPrimitive) &&
+           std::all_of(command.textures.begin(), command.textures.end(),
+                       [](const auto& texture) { return !texture; });
+  };
+#endif
   const auto predict_scope_writes = [&](size_t begin, uint32_t wanted) {
     constexpr uint32_t kAll = ((1u << kRenderTargetCount) - 1) | 0x30u;
     prediction_begin = prediction_stop = begin;
@@ -23609,7 +23708,14 @@ bool NativeGraphicsSystem::RecordNativeFrame(
       // guest has bound (ReuseNativeLightingAttachments): it only writes depth/stencil, so only
       // the depth-stencil surface has to match.
       uint32_t differing = same_surface(state.depth_stencil, first.depth_stencil) ? 0u : 0x10u;
-      for (uint32_t slot = 0; slot < kRenderTargetCount; ++slot) {
+#if XPORT_TITLE_ID == 0x4D5307D5
+      // Such a draw keeps the scope whatever color targets the guest has bound.
+      const bool joins =
+          !next.fixed_function_state.color_write_mask && joins_open_pass(next);
+#else
+      constexpr bool joins = false;
+#endif
+      for (uint32_t slot = 0; slot < kRenderTargetCount && !joins; ++slot) {
         if (!same_surface(state.render_targets[slot], first.render_targets[slot])) {
           differing |= 1u << slot;
         }
@@ -24588,6 +24694,23 @@ bool NativeGraphicsSystem::RecordNativeFrame(
 
 
 
+#if XPORT_TITLE_ID == 0x4D5307D5
+    // A depth/stencil-only draw borrows the open pass's color attachments (joins_open_pass);
+    // it keeps its zero write mask, so they are not written.
+    if (draw_command && rendering && joins_open_pass(command) &&
+        ReuseNativeLightingAttachments(active_target, target)) {
+      g_colorless_joins.fetch_add(1, std::memory_order_relaxed);
+    }
+    // A vertex shader samples textures while a fragment-only read barrier is pending inside an
+    // open scope (the scan at its start did not see it): end the scope for the dependency.
+    if (rendering && g_vertex_visibility_pending.load(std::memory_order_relaxed) &&
+        vertex_samples_textures(command)) {
+      end_rendering(__LINE__);
+      rendering = false;
+      g_vertex_visibility_splits.fetch_add(1, std::memory_order_relaxed);
+      record_vertex_visibility();
+    }
+#endif
     // this command would write an attachment the scope opened with STORE_OP_NONE (its
     // prediction missed): end the scope, the next one loads and stores it.
     if (rendering && scope_store_none && targets_equal(active_target, target) &&
@@ -24629,6 +24752,27 @@ bool NativeGraphicsSystem::RecordNativeFrame(
         ++g_rendering_split_reasons[why & 4095u];
         end_rendering(__LINE__);
       }
+#if XPORT_TITLE_ID == 0x4D5307D5
+      // Outside any pass: when a draw of this scope or a later one (up to the next resolve)
+      // samples textures in its vertex shader after a fragment-only read barrier, the
+      // vertex-stage dependency goes here, before the pass opens, instead of splitting it.
+      if (g_vertex_visibility_pending.load(std::memory_order_relaxed) &&
+          command_index >= vertex_visibility_clear_until) {
+        size_t ahead = command_index;
+        while (ahead < current_frame_.size() &&
+               current_frame_[ahead].type != CommandType::kResolve &&
+               current_frame_[ahead].type != CommandType::kPresent &&
+               !vertex_samples_textures(current_frame_[ahead])) {
+          ++ahead;
+        }
+        if (ahead < current_frame_.size() && vertex_samples_textures(current_frame_[ahead])) {
+          record_vertex_visibility();
+          vertex_visibility_clear_until = 0;
+        } else {
+          vertex_visibility_clear_until = ahead;
+        }
+      }
+#endif
       bool content_ready = true;
       // A clear command whose rectangle covers a whole color surface replaces
       // every channel of it (vkCmdClearAttachments ignores write masks): that
