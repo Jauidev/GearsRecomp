@@ -17,7 +17,7 @@ disco a un APK.
 - Controles táctiles y mandos físicos por Bluetooth o USB (Xbox, PlayStation y la mayoría de mandos
   Android), a la vez.
 - Probado solo unos minutos de campaña y solo en una GPU Mali.
-- Posee actualmente por los momentos no guarda la partida ni deja crear usuario (perfil), todavía no se ha añadido el apartado de crear perfil en el launcher (PAREN BOLA A ESTO PANAS)
+- Actualmente por los momentos no guarda la partida ni deja crear usuario (perfil), todavía no se ha añadido el apartado de crear perfil en el launcher (PAREN BOLA A ESTO PANAS)
 
 ## Instalar en Android
 
