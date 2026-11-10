@@ -35,6 +35,7 @@ uint32_t XamUserCreateAchievementEnumerator(uint32_t titleId, uint32_t userIndex
 uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const XCONTENT_DATA* pContentData,
     uint32_t dwContentFlags, be<uint32_t>* pdwDisposition, be<uint32_t>* pdwLicenseMask,
     uint32_t dwFileCacheSize, uint64_t uliContentSize, PXXOVERLAPPED pOverlapped);
+uint32_t XamContentDelete(uint32_t dwUserIndex, const XCONTENT_DATA* pContentData, XXOVERLAPPED* pOverlapped);
 uint32_t XamContentGetDeviceData(uint32_t DeviceID, XDEVICE_DATA* pDeviceData);
 uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped);
 uint32_t XamContentSetThumbnail(uint32_t dwUserIndex, const XCONTENT_DATA* pContentData,

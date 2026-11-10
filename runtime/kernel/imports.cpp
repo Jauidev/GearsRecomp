@@ -373,11 +373,6 @@ uint32_t XamGetSystemVersion()
     return 0;
 }
 
-void XamContentDelete()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
 uint32_t XamContentGetCreator(uint32_t userIndex, const XCONTENT_DATA* contentData, be<uint32_t>* isCreator, be<uint64_t>* xuid, XXOVERLAPPED* overlapped)
 {
     if (isCreator)

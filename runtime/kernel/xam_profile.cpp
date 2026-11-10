@@ -4,11 +4,12 @@
 // 1000-byte title-specific block; it first calls with no buffer and needs ERROR_INSUFFICIENT_BUFFER
 // with the size, then allocates and reads asynchronously.
 //
-// Values written by the game are kept in memory for the session (not saved to disk yet).
+// Values written by the game are saved in save/profile.bin and read back at the next start.
 #include <stdafx.h>
 #include <kernel/function.h>
 #include <kernel/xdm.h>
 #include <os/logger.h>
+#include <os/paths.h>
 
 uint32_t CompleteOverlapped(XXOVERLAPPED* overlapped, uint32_t result, uint32_t length);
 
@@ -98,6 +99,102 @@ namespace
         { 0x10040022, { 1, 1 } }, // XPROFILE_GAMER_ACTION_AUTO_AIM: on
     };
 
+    // The written settings are kept in save/profile.bin: the title stores its options and its
+    // campaign progress (unlocked chapters, difficulty) in the three title-specific blocks, and
+    // they were lost at every exit while they lived only in memory (2026-11-10).
+    // File: "XPRF", version, count, then per setting id, source, value, payload size, payload
+    // (host byte order; the file never leaves the device).
+    constexpr uint32_t PROFILE_MAGIC = 0x46525058, PROFILE_VERSION = 1;
+    bool g_settingsLoaded = false;
+
+    std::filesystem::path ProfilePath()
+    {
+        return os::paths::GetSavePath() / "profile.bin";
+    }
+
+    // Call with g_settingsMutex held.
+    void LoadSettings()
+    {
+        if (g_settingsLoaded)
+            return;
+        g_settingsLoaded = true;
+
+        FILE* file = fopen(ProfilePath().string().c_str(), "rb");
+        if (!file)
+            return;
+
+        uint32_t header[3]{};
+        uint32_t loaded = 0;
+        if (fread(header, sizeof(header), 1, file) == 1 && header[0] == PROFILE_MAGIC && header[1] == PROFILE_VERSION)
+        {
+            for (uint32_t i = 0; i < header[2]; i++)
+            {
+                uint32_t id = 0, source = 0, size = 0;
+                uint64_t value = 0;
+                if (fread(&id, 4, 1, file) != 1 || fread(&source, 4, 1, file) != 1 || fread(&value, 8, 1, file) != 1 ||
+                    fread(&size, 4, 1, file) != 1 || size > 0xFFF)
+                {
+                    break;
+                }
+                StoredSetting stored;
+                stored.source = source;
+                stored.value = value;
+                stored.payload.resize(size);
+                if (size != 0 && fread(stored.payload.data(), 1, size, file) != size)
+                    break;
+                g_settings[id] = std::move(stored);
+                ++loaded;
+            }
+        }
+        fclose(file);
+        LOGFN("profile: {} settings loaded from {}", loaded, ProfilePath().string());
+    }
+
+    // Call with g_settingsMutex held. Written beside and renamed, so a kill in the middle of a
+    // write leaves the previous file.
+    void SaveSettings()
+    {
+        std::vector<uint8_t> data;
+        const auto put = [&data](const void* bytes, size_t size) {
+            data.insert(data.end(), static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + size);
+        };
+
+        uint32_t count = 0;
+        for (const auto& [id, stored] : g_settings)
+            count += stored.source == 2;
+        const uint32_t header[3] = { PROFILE_MAGIC, PROFILE_VERSION, count };
+        put(header, sizeof(header));
+        for (const auto& [id, stored] : g_settings)
+        {
+            if (stored.source != 2)
+                continue;
+            const uint32_t size = uint32_t(stored.payload.size());
+            put(&id, 4);
+            put(&stored.source, 4);
+            put(&stored.value, 8);
+            put(&size, 4);
+            put(stored.payload.data(), size);
+        }
+
+        const std::filesystem::path path = ProfilePath();
+        std::filesystem::path temporary = path;
+        temporary += ".tmp";
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        FILE* file = fopen(temporary.string().c_str(), "wb");
+        if (!file)
+        {
+            LOGF_WARNING("cannot write {}", temporary.string());
+            return;
+        }
+        const bool written = fwrite(data.data(), 1, data.size(), file) == data.size();
+        fclose(file);
+        if (written)
+            std::filesystem::rename(temporary, path, ec);
+        if (!written || ec)
+            LOGF_WARNING("cannot save {}", path.string());
+    }
+
     // A title-specific block that was never written has no value, like on a fresh console profile.
     StoredSetting Lookup(uint32_t id)
     {
@@ -118,6 +215,7 @@ uint32_t XamUserReadProfileSettings(uint32_t titleId, uint32_t userIndex, uint32
         return ERROR_NO_SUCH_USER_X;
 
     std::lock_guard guard{ g_settingsMutex };
+    LoadSettings();
 
     uint32_t needed = sizeof(ReadResults) + settingCount * sizeof(ProfileSetting);
     for (uint32_t i = 0; i < settingCount; i++)
@@ -183,6 +281,7 @@ uint32_t XamUserWriteProfileSettings(uint32_t titleId, uint32_t userIndex, uint3
 {
     {
         std::lock_guard guard{ g_settingsMutex };
+        LoadSettings();
         for (uint32_t i = 0; i < settingCount; i++)
         {
             const ProfileSetting& in = settings[i];
@@ -208,6 +307,7 @@ uint32_t XamUserWriteProfileSettings(uint32_t titleId, uint32_t userIndex, uint3
 
             g_settings[id] = std::move(stored);
         }
+        SaveSettings();
     }
 
     LOGF("{} settings written", settingCount);

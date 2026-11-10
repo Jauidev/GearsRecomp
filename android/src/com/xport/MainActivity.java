@@ -706,6 +706,7 @@ public class MainActivity extends Activity {
         }
 
         surfaceFps = optionFloat(options, "XPORT_SURFACE_FPS", 60);
+        preferDisplayRate();
         // The screen's landscape size, known before the surface exists: the native renderer sizes
         // the game's device surfaces from it at boot (rexglue_glue/xd3d/d3d_hooks.cpp).
         android.graphics.Point screen = new android.graphics.Point();
@@ -849,6 +850,53 @@ public class MainActivity extends Activity {
             }
         }
         return value;
+    }
+
+    // The surface's declared rate alone left the panel at 120 Hz (POCO X6 Pro, Android 16,
+    // 2026-11-10): every touch on the controls boosts the window back to the panel's peak rate, so
+    // SurfaceFlinger and the composer kept working at 120 Hz for a 30 fps game. The window asks
+    // for the display mode of that rate itself (same size as the current mode) and, on Android 15+,
+    // turns the touch boost off (Window.setFrameRateBoostOnTouchEnabled, by reflection: the app is
+    // compiled against API 34).
+    private void preferDisplayRate() {
+        if (surfaceFps <= 0) {
+            return;
+        }
+        try {
+            android.view.Display display = getWindowManager().getDefaultDisplay();
+            android.view.Display.Mode current = display.getMode();
+            int modeId = 0;
+            for (android.view.Display.Mode mode : display.getSupportedModes()) {
+                if (mode.getPhysicalWidth() == current.getPhysicalWidth()
+                        && mode.getPhysicalHeight() == current.getPhysicalHeight()
+                        && Math.abs(mode.getRefreshRate() - surfaceFps) < 1f) {
+                    modeId = mode.getModeId();
+                }
+            }
+            if (modeId != 0) {
+                WindowManager.LayoutParams attributes = getWindow().getAttributes();
+                attributes.preferredDisplayModeId = modeId;
+                // Caps the render rate too where the platform lets an app reach the field.
+                try {
+                    WindowManager.LayoutParams.class.getField("preferredMaxDisplayRefreshRate")
+                            .setFloat(attributes, surfaceFps);
+                    android.util.Log.i("xport", "display rate capped at " + surfaceFps);
+                } catch (Throwable e) {
+                    android.util.Log.i("xport", "display rate cap not available: " + e);
+                }
+                getWindow().setAttributes(attributes);
+            }
+            boolean boostOff = false;
+            if (android.os.Build.VERSION.SDK_INT >= 35) {
+                android.view.Window.class.getMethod("setFrameRateBoostOnTouchEnabled", boolean.class)
+                        .invoke(getWindow(), false);
+                boostOff = true;
+            }
+            android.util.Log.i("xport", "display mode preferred: " + modeId + " (" + surfaceFps
+                    + " Hz), touch boost off: " + boostOff);
+        } catch (Throwable e) {
+            android.util.Log.w("xport", "display rate not set: " + e);
+        }
     }
 
     private void declareFrameRate(Surface surface) {

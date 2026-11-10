@@ -513,6 +513,38 @@ uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const 
     return FinishContentRequest(pOverlapped, ERROR_SUCCESS);
 }
 
+// The title saves a checkpoint by deleting the old content and creating it again with CREATE_NEW
+// (sub_821B66E0: XamContentDelete, then XamContentCreateEx with flags 0x11). This was a stub, so
+// the content stayed, the creation answered ERROR_ALREADY_EXISTS and only the first checkpoint
+// ever reached the disk (2026-11-10). Only saves are deleted, never the game data.
+uint32_t XamContentDelete(uint32_t dwUserIndex, const XCONTENT_DATA* pContentData, XXOVERLAPPED* pOverlapped)
+{
+    constexpr uint32_t ERROR_FILE_NOT_FOUND_X = 2;
+
+    if (!pContentData || pContentData->dwContentType != XCONTENTTYPE_SAVEDATA)
+        return FinishContentRequest(pOverlapped, ERROR_FILE_NOT_FOUND_X);
+
+    const std::string name(pContentData->szFileName, strnlen(pContentData->szFileName, sizeof(pContentData->szFileName)));
+    // An empty or relative name would resolve to the save folder itself or outside it.
+    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos)
+        return FinishContentRequest(pOverlapped, ERROR_FILE_NOT_FOUND_X);
+
+    const std::filesystem::path root = ContentRoot(*pContentData);
+    std::error_code ec;
+    const bool onDisk = std::filesystem::is_directory(root, ec);
+    const bool registered = gContentRegistry[XCONTENTTYPE_SAVEDATA - 1].erase(StringHash(pContentData->szFileName)) != 0;
+
+    if (onDisk)
+        std::filesystem::remove_all(root, ec);
+    std::filesystem::remove(ContentRecordPath(root), ec);
+    std::filesystem::path thumbnail = root;
+    thumbnail += ".thumbnail";
+    std::filesystem::remove(thumbnail, ec);
+
+    LOGF("'{}' -> {}", name, onDisk || registered ? "deleted" : "not found");
+    return FinishContentRequest(pOverlapped, onDisk || registered ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND_X);
+}
+
 uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped)
 {
     gRootMap.erase(StringHash(szRootName));
